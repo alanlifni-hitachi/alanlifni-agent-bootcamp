@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -44,7 +44,7 @@ class TaskContext:
     uncertainties: list[str] = field(default_factory=list)
     iteration: int = 0
     timestamp: str = field(
-        default_factory=lambda: datetime.utcnow().isoformat(timespec="seconds")
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
 
 
@@ -87,5 +87,6 @@ class ReviewFeedback:
     """Output of the Reviewer agent."""
 
     ok: bool = False
+    retriable: bool = True  # False when issues are unfixable (e.g. no KB data)
     missing: list[str] = field(default_factory=list)
     notes: str = ""

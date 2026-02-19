@@ -291,6 +291,9 @@ class Orchestrator:
                     "Maximum analysis iterations reached; some data may be incomplete."
                 )
 
+        answer.caveats.append(
+            f"Iterations used: {ctx.iteration}/{self.max_iter}."
+        )
         tracer.end(output={"confidence": answer.confidence, "caveats": answer.caveats})
         return answer
 

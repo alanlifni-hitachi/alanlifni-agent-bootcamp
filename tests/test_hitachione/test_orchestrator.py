@@ -223,7 +223,7 @@ class TestReflectionLoop:
         orch.researcher = MagicMock()
         orch.researcher.run.return_value = [cr_xom, cr_cvx]
 
-        ans = _quick_answer(confidence=0.0, markdown="No data available for these tickers.")
+        ans = _quick_answer(confidence=0.0, markdown="No data available in the knowledge base for these oil tickers. XOM and CVX have no records.")
         ans.raw_research = [cr_xom, cr_cvx]
         orch.synthesizer = MagicMock()
         orch.synthesizer.run.return_value = ans
@@ -314,6 +314,61 @@ class TestCompanyRetrievalGating:
 
         answer = orch.run("TSLA outlook")
         mock_find.assert_not_called()
+
+    @patch.object(Orchestrator, "_parse_intent")
+    @patch("src.hitachione.agents.orchestrator._find_symbols")
+    def test_explicit_entities_ignore_kb_hints(self, mock_find, mock_parse):
+        """KB hints should not pollute entity set when query has explicit entities."""
+        def parse_side_effect(ctx):
+            ctx.intent = Intent.COMPARE
+            ctx.entities = ["XOM", "CVX"]
+            ctx.timeframe = "2020"
+            ctx.sector = "energy"
+
+        mock_parse.side_effect = parse_side_effect
+
+        orch = Orchestrator(max_iterations=1)
+        orch.kb_agent = MagicMock()
+        orch.kb_agent.run.return_value = {
+            "aliases": {},
+            "entity_hints": ["MSFT", "TSLA", "JPM"],
+            "summaries": [],
+        }
+
+        orch.researcher = MagicMock()
+        orch.researcher.run.return_value = [
+            CompanyResearch(ticker="XOM"),
+            CompanyResearch(ticker="CVX"),
+        ]
+        orch.synthesizer = MagicMock()
+        orch.synthesizer.run.return_value = _quick_answer()
+        orch.reviewer = MagicMock()
+        orch.reviewer.run.return_value = _ok_feedback()
+
+        orch.run("Compare Exxon and Chevron performance in 2020")
+        orch.researcher.run.assert_called_once()
+        _, entities = orch.researcher.run.call_args[0]
+        assert entities == ["XOM", "CVX"]
+        mock_find.assert_not_called()
+
+
+class TestIntentAliasMapping:
+    def test_parse_intent_adds_company_aliases(self):
+        """Deterministic alias map should add XOM/CVX even if LLM omits entities."""
+        orch = Orchestrator(max_iterations=1)
+
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        mock_resp.choices[0].message.content = (
+            '{"intent": "compare", "entities": [], "timeframe": "2020", "sector": "energy"}'
+        )
+        orch._llm.chat.completions.create.return_value = mock_resp
+
+        ctx = TaskContext(user_query="Compare Exxon and Chevron performance in 2020")
+        orch._parse_intent(ctx)
+
+        assert "XOM" in ctx.entities
+        assert "CVX" in ctx.entities
 
 
 # ── Plan generation ─────────────────────────────────────────────────────

@@ -23,6 +23,7 @@ dependencies = [
     "pydantic-ai-slim[logfire]>=0.3.7",
     "scikit-learn>=1.7.0",
     "weaviate-client>=4.15.4",
+    "yfinance>=0.2.54",
 ]
 
 [build-system]

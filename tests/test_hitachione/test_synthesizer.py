@@ -142,3 +142,102 @@ class TestSynthesizerAgent:
         agent = self._make_agent("# Answer")
         ans = agent.run(_ctx(), [_cr("AAPL")])
         assert len(ans.citations) >= 1
+
+    def test_data_provenance_from_weaviate(self):
+        agent = self._make_agent("# Answer")
+        cr = _cr("AAPL")
+        cr.sentiment["data_summary"] = {
+            "record_count": 12,
+            "source": "weaviate",
+            "dataset_sources": [
+                "stock_market",
+                "bloomberg_financial_news",
+            ],
+            "yahoo_finance_fallback_used": False,
+        }
+        cr.performance["data_summary"] = {
+            "price_records": 8,
+            "earnings_records": 1,
+            "news_records": 3,
+            "source": "weaviate",
+            "dataset_sources": [
+                "sp500_earnings_transcripts",
+            ],
+            "yahoo_finance_fallback_used": False,
+        }
+
+        ans = agent.run(_ctx(), [cr])
+
+        assert "Data used for inference" in ans.markdown
+        assert "stock_market" in ans.markdown
+        assert "sp500_earnings_transcripts" in ans.markdown
+        assert ans.yahoo_finance_fallback_used is False
+        assert "AAPL" in ans.per_ticker_data_sources
+
+    def test_data_provenance_marks_yahoo_fallback(self):
+        agent = self._make_agent("# Answer")
+        cr = _cr("XOM")
+        cr.sentiment["data_summary"] = {
+            "record_count": 5,
+            "source": "yahoo_finance",
+            "dataset_sources": ["yahoo_finance_live"],
+            "yahoo_finance_fallback_used": True,
+            "yahoo_finance_fallback_attempted": True,
+            "yahoo_finance_fallback_error": "",
+        }
+
+        ans = agent.run(_ctx(), [cr])
+
+        assert ans.yahoo_finance_fallback_used is True
+        assert ans.per_ticker_yahoo_fallback["XOM"] is True
+        assert "Any Yahoo Finance fallback used: yes" in ans.markdown
+
+    def test_data_provenance_marks_failed_fallback(self):
+        agent = self._make_agent("# Answer")
+        cr = _cr("XOM")
+        cr.sentiment["data_summary"] = {
+            "record_count": 0,
+            "source": "none",
+            "dataset_sources": [],
+            "yahoo_finance_fallback_used": False,
+            "yahoo_finance_fallback_attempted": True,
+            "yahoo_finance_fallback_error": "No module named 'yfinance'",
+        }
+
+        ans = agent.run(_ctx(), [cr])
+
+        assert ans.per_ticker_yahoo_fallback["XOM"] is False
+        assert ans.per_ticker_yahoo_fallback_attempted["XOM"] is True
+        assert "yahoo_finance_fallback=failed" in ans.markdown
+        assert "No module named 'yfinance'" in ans.markdown
+
+    def test_historical_timeframe_summary_is_rendered(self):
+        agent = self._make_agent("# Answer")
+        ctx = _ctx(query="Tell me about XOM performance in 2012")
+        ctx.timeframe = "2012"
+        cr = _cr("XOM")
+        cr.performance["data_summary"] = {
+            "price_records": 249,
+            "earnings_records": 1,
+            "news_records": 10,
+            "source": "yahoo_finance",
+            "dataset_sources": ["yahoo_finance_live"],
+            "yahoo_finance_fallback_used": True,
+            "period_stats": {
+                "start_date": "2012-01-03",
+                "end_date": "2012-12-31",
+                "first_close": 84.76,
+                "last_close": 87.98,
+                "percent_change": 3.8,
+                "period_high": 93.67,
+                "period_low": 75.55,
+                "trading_days": 249,
+            },
+        }
+
+        ans = agent.run(ctx, [cr])
+
+        assert "Historical period summary (2012)" in ans.markdown
+        assert "2012-01-03 to 2012-12-31" in ans.markdown
+        assert "(+3.80%)" in ans.markdown
+        assert "trading_days=249" in ans.markdown

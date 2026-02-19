@@ -36,25 +36,25 @@ _RETRY_BACKOFF = 2.0  # seconds; doubles each attempt
 
 # ── Lazy imports for the existing tools (avoid circular / heavy init) ──
 
-def _sentiment(ticker: str) -> dict[str, Any]:
+def _sentiment(ticker: str, timeframe: str = "") -> dict[str, Any]:
     from ..tools.sentiment_analysis_tool.tool import analyze_ticker_sentiment_sync
-    return analyze_ticker_sentiment_sync(ticker)
+    return analyze_ticker_sentiment_sync(ticker, timeframe=timeframe)
 
 
-def _performance(ticker: str) -> dict[str, Any]:
+def _performance(ticker: str, timeframe: str = "") -> dict[str, Any]:
     from ..tools.performance_analysis_tool.tool import analyse_stock_performance
-    return analyse_stock_performance(ticker)
+    return analyse_stock_performance(ticker, timeframe=timeframe)
 
 
-def _call_with_retry(fn, ticker: str, tool_name: str) -> dict[str, Any]:
-    """Call *fn(ticker)* with up to ``_MAX_RETRIES`` attempts on failure.
+def _call_with_retry(fn, ticker: str, tool_name: str, timeframe: str = "") -> dict[str, Any]:
+    """Call *fn(ticker, timeframe)* with up to ``_MAX_RETRIES`` attempts on failure.
 
     Raises the last exception if all attempts fail.
     """
     last_exc: Exception | None = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            return fn(ticker)
+            return fn(ticker, timeframe=timeframe)
         except Exception as exc:
             last_exc = exc
             if attempt < _MAX_RETRIES:
@@ -72,14 +72,14 @@ def _call_with_retry(fn, ticker: str, tool_name: str) -> dict[str, Any]:
     raise last_exc  # type: ignore[misc]
 
 
-def _research_one(ticker: str) -> CompanyResearch:
+def _research_one(ticker: str, timeframe: str = "") -> CompanyResearch:
     """Fetch sentiment + performance for one ticker **in parallel**."""
     cr = CompanyResearch(ticker=ticker)
 
     # Fire both tool calls concurrently within a small thread pool
     with ThreadPoolExecutor(max_workers=2) as inner:
-        sent_future = inner.submit(_call_with_retry, _sentiment, ticker, "sentiment")
-        perf_future = inner.submit(_call_with_retry, _performance, ticker, "performance")
+        sent_future = inner.submit(_call_with_retry, _sentiment, ticker, "sentiment", timeframe)
+        perf_future = inner.submit(_call_with_retry, _performance, ticker, "performance", timeframe)
 
         # Collect sentiment
         try:
@@ -116,6 +116,7 @@ class ResearcherAgent:
 
     def run(self, ctx: TaskContext, entities: list[str]) -> list[CompanyResearch]:
         """Research every entity concurrently; accumulate errors without crashing."""
+        timeframe = getattr(ctx, 'timeframe', '') or ''
         ctx.observations.append(
             f"Researching {len(entities)} entities in parallel "
             f"(max_workers={self.max_workers})…"
@@ -125,7 +126,7 @@ class ResearcherAgent:
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             future_to_ticker = {
-                pool.submit(_research_one, ticker): ticker
+                pool.submit(_research_one, ticker, timeframe): ticker
                 for ticker in entities
             }
             for future in as_completed(future_to_ticker):

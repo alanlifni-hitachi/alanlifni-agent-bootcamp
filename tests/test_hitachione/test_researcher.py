@@ -13,33 +13,33 @@ from src.hitachione.models.schemas import CompanyResearch, TaskContext, ToolErro
 
 # ── Fixtures / helpers ──────────────────────────────────────────────────
 
-def _fake_sentiment(ticker: str) -> dict:
+def _fake_sentiment(ticker: str, **kwargs) -> dict:
     return {"rating": 8, "label": "Positive", "rationale": f"{ticker} looks good",
             "references": [f"ref1-{ticker}", f"ref2-{ticker}"]}
 
 
-def _fake_performance(ticker: str) -> dict:
+def _fake_performance(ticker: str, **kwargs) -> dict:
     return {"performance_score": 7, "outlook": "Bullish",
             "justification": f"{ticker} strong growth"}
 
 
-def _slow_sentiment(ticker: str) -> dict:
+def _slow_sentiment(ticker: str, **kwargs) -> dict:
     """Simulates a 0.3s network call."""
     time.sleep(0.3)
     return _fake_sentiment(ticker)
 
 
-def _slow_performance(ticker: str) -> dict:
+def _slow_performance(ticker: str, **kwargs) -> dict:
     """Simulates a 0.3s network call."""
     time.sleep(0.3)
     return _fake_performance(ticker)
 
 
-def _failing_sentiment(ticker: str) -> dict:
+def _failing_sentiment(ticker: str, **kwargs) -> dict:
     raise RuntimeError(f"Sentiment API down for {ticker}")
 
 
-def _failing_performance(ticker: str) -> dict:
+def _failing_performance(ticker: str, **kwargs) -> dict:
     raise RuntimeError(f"Performance API down for {ticker}")
 
 
@@ -164,7 +164,7 @@ class TestResearcherTimeout:
     @patch("src.hitachione.agents.researcher._MAX_RETRIES", 1)
     @patch("src.hitachione.agents.researcher._RETRY_BACKOFF", 0.0)
     @patch("src.hitachione.agents.researcher._performance", side_effect=_fake_performance)
-    @patch("src.hitachione.agents.researcher._sentiment", side_effect=lambda t: time.sleep(5) or _fake_sentiment(t))
+    @patch("src.hitachione.agents.researcher._sentiment", side_effect=lambda t, **kw: time.sleep(5) or _fake_sentiment(t))
     def test_timeout_captured_as_error(self, mock_sent, mock_perf):
         """If a tool exceeds _TOOL_TIMEOUT, a ToolError is recorded."""
         cr = _research_one("SLOW")
@@ -181,7 +181,7 @@ class TestRetryLogic:
     def test_retry_succeeds_on_second_attempt(self):
         """If a tool fails once then succeeds, the result is captured."""
         call_count = 0
-        def flaky_sentiment(ticker: str) -> dict:
+        def flaky_sentiment(ticker: str, **kwargs) -> dict:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -196,7 +196,7 @@ class TestRetryLogic:
     @patch("src.hitachione.agents.researcher._MAX_RETRIES", 3)
     def test_retry_exhausted_raises(self):
         """If all retries fail, the last exception is raised."""
-        def always_failing(ticker: str) -> dict:
+        def always_failing(ticker: str, **kwargs) -> dict:
             raise ConnectionError("Weaviate down permanently")
 
         with pytest.raises(ConnectionError, match="permanently"):
@@ -208,7 +208,7 @@ class TestRetryLogic:
     def test_research_one_retries_transient_failure(self, mock_perf):
         """_research_one recovers from a transient sentiment failure."""
         call_count = 0
-        def flaky(ticker):
+        def flaky(ticker, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count <= 2:

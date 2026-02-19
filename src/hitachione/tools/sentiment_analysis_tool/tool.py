@@ -17,15 +17,12 @@ from dotenv import load_dotenv
 # Load .env from project root (5 levels up from this file)
 load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-
 import weaviate
 from weaviate.auth import AuthApiKey
 from weaviate.classes.query import Filter
 from openai import AsyncOpenAI
 
-from utils.env_vars import Configs
+from ...config.settings import OPENAI_API_KEY, OPENAI_BASE_URL, WORKER_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -294,15 +291,14 @@ def _format_kb_data(records: list[dict[str, Any]], max_chars: int = 15000) -> st
 
 async def analyze_sentiment(text: str, model: str | None = None) -> dict[str, Any]:
     """Analyze sentiment for arbitrary text."""
-    configs = Configs()
     client = AsyncOpenAI(
-        base_url=configs.openai_base_url,
-        api_key=configs.openai_api_key,
+        base_url=OPENAI_BASE_URL,
+        api_key=OPENAI_API_KEY,
     )
 
     try:
         response = await client.chat.completions.create(
-            model=model or configs.default_worker_model,
+            model=model or WORKER_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": text},
@@ -330,19 +326,32 @@ async def analyze_ticker_sentiment(
     ticker: str,
     model: str | None = None,
     limit: int = 20,
+    timeframe: str = "",
 ) -> dict[str, Any]:
     """Analyze sentiment for a stock ticker using Weaviate KB data.
 
     Retrieves all available data (price history, earnings, news) for the
     ticker from the Weaviate knowledge base and produces a sentiment rating.
     """
-    configs = Configs()
     client = AsyncOpenAI(
-        base_url=configs.openai_base_url,
-        api_key=configs.openai_api_key,
+        base_url=OPENAI_BASE_URL,
+        api_key=OPENAI_API_KEY,
     )
 
     records = query_weaviate_by_ticker(ticker, limit=limit)
+    data_source = "weaviate"
+    yahoo_fallback_attempted = False
+    yahoo_fallback_error = ""
+
+    if not records:
+        # Fallback: try Yahoo Finance for live data
+        yahoo_fallback_attempted = True
+        try:
+            from ..yahoo_finance_fallback import get_yf_sentiment_records
+            records = get_yf_sentiment_records(ticker, timeframe=timeframe)
+            data_source = "yahoo_finance"
+        except Exception as exc:
+            yahoo_fallback_error = str(exc)
 
     if not records:
         return {
@@ -351,13 +360,21 @@ async def analyze_ticker_sentiment(
             "label": "unknown",
             "rationale": f"No data found for ticker {ticker} in the knowledge base.",
             "references": [],
+            "data_summary": {
+                "record_count": 0,
+                "source": "none",
+                "dataset_sources": [],
+                "yahoo_finance_fallback_used": False,
+                "yahoo_finance_fallback_attempted": yahoo_fallback_attempted,
+                "yahoo_finance_fallback_error": yahoo_fallback_error,
+            },
         }
 
     combined = _format_kb_data(records)
 
     try:
         response = await client.chat.completions.create(
-            model=model or configs.default_worker_model,
+            model=model or WORKER_MODEL,
             messages=[
                 {"role": "system", "content": TICKER_SYSTEM_PROMPT},
                 {"role": "user", "content": combined},
@@ -377,6 +394,17 @@ async def analyze_ticker_sentiment(
     data["label"] = _derive_label(rating)
     data.setdefault("rationale", "")
     data.setdefault("references", [])
+    dataset_sources = sorted({
+        str(rec.get("dataset_source", "unknown")) for rec in records
+    })
+    data["data_summary"] = {
+        "record_count": len(records),
+        "source": data_source,
+        "dataset_sources": dataset_sources,
+        "yahoo_finance_fallback_used": data_source == "yahoo_finance",
+        "yahoo_finance_fallback_attempted": yahoo_fallback_attempted,
+        "yahoo_finance_fallback_error": yahoo_fallback_error,
+    }
     return data
 
 
@@ -386,10 +414,9 @@ async def analyze_financial_year_sentiment(
     max_results: int = 20,
 ) -> dict[str, Any]:
     """Analyze sentiment for financial news in a given year using Weaviate KB."""
-    configs = Configs()
     client = AsyncOpenAI(
-        base_url=configs.openai_base_url,
-        api_key=configs.openai_api_key,
+        base_url=OPENAI_BASE_URL,
+        api_key=OPENAI_API_KEY,
     )
 
     records = query_weaviate_by_year(year, limit=max_results)
@@ -406,7 +433,7 @@ async def analyze_financial_year_sentiment(
 
     try:
         response = await client.chat.completions.create(
-            model=model or configs.default_worker_model,
+            model=model or WORKER_MODEL,
             messages=[
                 {"role": "system", "content": YEAR_SYSTEM_PROMPT},
                 {"role": "user", "content": combined},
@@ -440,10 +467,9 @@ async def analyze_financial_news_sentiment(
     Searches the Weaviate KB for articles matching the query and produces
     a sentiment rating based on the retrieved content.
     """
-    configs = Configs()
     client = AsyncOpenAI(
-        base_url=configs.openai_base_url,
-        api_key=configs.openai_api_key,
+        base_url=OPENAI_BASE_URL,
+        api_key=OPENAI_API_KEY,
     )
 
     records = query_weaviate_by_topic(query, limit=limit)
@@ -460,7 +486,7 @@ async def analyze_financial_news_sentiment(
 
     try:
         response = await client.chat.completions.create(
-            model=model or configs.default_worker_model,
+            model=model or WORKER_MODEL,
             messages=[
                 {"role": "system", "content": NEWS_SYSTEM_PROMPT},
                 {"role": "user", "content": combined},
@@ -493,9 +519,12 @@ def analyze_sentiment_sync(text: str, model: str | None = None) -> dict[str, Any
 
 def analyze_ticker_sentiment_sync(
     ticker: str, model: str | None = None, limit: int = 20,
+    timeframe: str = "",
 ) -> dict[str, Any]:
     """Synchronous wrapper for ``analyze_ticker_sentiment``."""
-    return _run_async(analyze_ticker_sentiment(ticker, model=model, limit=limit))
+    return _run_async(analyze_ticker_sentiment(
+        ticker, model=model, limit=limit, timeframe=timeframe,
+    ))
 
 
 def analyze_year_sentiment_sync(

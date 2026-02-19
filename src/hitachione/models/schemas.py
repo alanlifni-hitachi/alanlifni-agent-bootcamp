@@ -80,6 +80,12 @@ class SynthesizedAnswer:
     citations: list[str] = field(default_factory=list)
     confidence: float = 0.0        # 0-1
     raw_research: list[CompanyResearch] = field(default_factory=list)
+    data_sources: list[str] = field(default_factory=list)
+    per_ticker_data_sources: dict[str, list[str]] = field(default_factory=dict)
+    yahoo_finance_fallback_used: bool = False
+    per_ticker_yahoo_fallback: dict[str, bool] = field(default_factory=dict)
+    per_ticker_yahoo_fallback_attempted: dict[str, bool] = field(default_factory=dict)
+    per_ticker_yahoo_fallback_error: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

@@ -64,6 +64,33 @@ Rules:
 - Keep it concise.
 """
 
+_ENTITY_ALIASES: dict[str, str] = {
+    "tesla": "TSLA",
+    "apple": "AAPL",
+    "google": "GOOGL",
+    "alphabet": "GOOGL",
+    "microsoft": "MSFT",
+    "meta": "META",
+    "facebook": "META",
+    "amazon": "AMZN",
+    "nvidia": "NVDA",
+    "exxon": "XOM",
+    "exxon mobil": "XOM",
+    "chevron": "CVX",
+    "jpmorgan": "JPM",
+    "jp morgan": "JPM",
+}
+
+
+def _augment_entities_from_query(query: str, entities: list[str]) -> list[str]:
+    """Add deterministic ticker aliases mentioned in the raw query text."""
+    merged = {str(symbol).upper() for symbol in entities if str(symbol).strip()}
+    text = query.lower()
+    for company_name, ticker in _ENTITY_ALIASES.items():
+        if re.search(rf"\b{re.escape(company_name)}\b", text):
+            merged.add(ticker)
+    return sorted(merged)
+
 # ── Company retrieval helper ─────────────────────────────────────────────
 
 def _find_symbols(query: str) -> list[str]:
@@ -144,9 +171,14 @@ class Orchestrator:
                 kb_data = self.kb_agent.run(ctx)
                 sp.update(output=kb_data)
                 # Merge entity hints into context
-                for hint in kb_data.get("entity_hints", []):
-                    if hint not in ctx.entities:
-                        ctx.entities.append(hint)
+                if not explicit_entities_in_query:
+                    for hint in kb_data.get("entity_hints", []):
+                        if hint not in ctx.entities:
+                            ctx.entities.append(hint)
+                else:
+                    ctx.observations.append(
+                        "Skipping KB entity hints because query has explicit entities"
+                    )
 
             # ── STEP 3b: Act – Company retrieval for broad queries ─────
             if not explicit_entities_in_query and iteration == 1:
@@ -293,7 +325,8 @@ class Orchestrator:
         except ValueError:
             ctx.intent = Intent.MIXED
 
-        ctx.entities = [e.upper() for e in data.get("entities", [])]
+        llm_entities = [e.upper() for e in data.get("entities", [])]
+        ctx.entities = _augment_entities_from_query(ctx.user_query, llm_entities)
         ctx.timeframe = data.get("timeframe", ctx.timeframe) or ""
         ctx.sector = data.get("sector", "") or ""
 

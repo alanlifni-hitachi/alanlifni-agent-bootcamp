@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from typing import Any, List
 
+from openai import AsyncOpenAI
 import weaviate
 from weaviate.auth import AuthApiKey
 from weaviate.classes.query import Filter
@@ -20,9 +21,7 @@ from dotenv import load_dotenv
 # Load .env from project root
 load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-from utils.client_manager import AsyncClientManager
+from ...config.settings import OPENAI_API_KEY, OPENAI_BASE_URL, WORKER_MODEL
 
 # ---------------------------------------------------------------------------
 # Weaviate helpers
@@ -79,6 +78,7 @@ def get_ticker_data(ticker: str) -> dict[str, list[dict]]:
             limit=100,
             return_properties=[
                 "date", "open", "high", "low", "close", "volume", "text",
+                "dataset_source",
             ],
         )
         price_data = [
@@ -97,7 +97,7 @@ def get_ticker_data(ticker: str) -> dict[str, list[dict]]:
             limit=100,
             return_properties=[
                 "date", "quarter", "fiscal_year", "fiscal_quarter", "text",
-                "title",
+                "title", "dataset_source",
             ],
         )
         earnings = [
@@ -119,7 +119,7 @@ def get_ticker_data(ticker: str) -> dict[str, list[dict]]:
                 )
             ),
             limit=100,
-            return_properties=["date", "title", "text", "category"],
+            return_properties=["date", "title", "text", "category", "dataset_source"],
         )
         # Also grab news that *mention* this ticker (mentioned_companies)
         mentioned_response = col.query.fetch_objects(
@@ -127,7 +127,7 @@ def get_ticker_data(ticker: str) -> dict[str, list[dict]]:
                 [ticker.upper()]
             ),
             limit=50,
-            return_properties=["date", "title", "text", "category"],
+            return_properties=["date", "title", "text", "category", "dataset_source"],
         )
 
         seen_titles: set[str] = set()
@@ -153,19 +153,10 @@ def get_ticker_data(ticker: str) -> dict[str, list[dict]]:
 # LLM-based performance scoring
 # ---------------------------------------------------------------------------
 
-_client_manager = None
-
-
-def _get_client_manager() -> AsyncClientManager:
-    global _client_manager
-    if _client_manager is None:
-        _client_manager = AsyncClientManager()
-    return _client_manager
-
 
 async def _analyse_with_llm(ticker: str, data: dict[str, list[dict]]) -> dict:
     """Send retrieved data to an LLM and get a structured performance analysis."""
-    cm = _get_client_manager()
+    client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
 
     # Build context sections
     price_summary = "\n".join(
@@ -207,13 +198,15 @@ Scoring guide:
   6-10 → Positive (rising price, strong earnings, positive sentiment)
 """
 
-    response = await cm.openai_client.chat.completions.create(
-        model=cm.configs.default_worker_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-
-    content = response.choices[0].message.content.strip()
+    try:
+        response = await client.chat.completions.create(
+            model=WORKER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        content = response.choices[0].message.content.strip()
+    finally:
+        await client.close()
 
     # Extract JSON from potential markdown code fences
     if "```json" in content:
@@ -238,12 +231,57 @@ def _run_async(coro):
     return asyncio.run(coro)
 
 
+def _compute_period_stats(price_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute compact deterministic stats for a historical price period."""
+    if not price_rows:
+        return {}
+
+    sorted_rows = sorted(price_rows, key=lambda d: str(d.get("date", "")))
+
+    def _to_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    closes = [_to_float(row.get("close")) for row in sorted_rows]
+    highs = [_to_float(row.get("high")) for row in sorted_rows]
+    lows = [_to_float(row.get("low")) for row in sorted_rows]
+    volumes = [_to_float(row.get("volume")) for row in sorted_rows]
+
+    close_vals = [v for v in closes if v is not None]
+    if not close_vals:
+        return {
+            "start_date": str(sorted_rows[0].get("date", "")),
+            "end_date": str(sorted_rows[-1].get("date", "")),
+            "trading_days": len(sorted_rows),
+        }
+
+    first_close = close_vals[0]
+    last_close = close_vals[-1]
+    pct_change = ((last_close - first_close) / first_close) * 100 if first_close else None
+
+    return {
+        "start_date": str(sorted_rows[0].get("date", "")),
+        "end_date": str(sorted_rows[-1].get("date", "")),
+        "first_close": round(first_close, 2),
+        "last_close": round(last_close, 2),
+        "percent_change": round(pct_change, 2) if pct_change is not None else None,
+        "period_high": round(max(v for v in highs if v is not None), 2) if any(v is not None for v in highs) else None,
+        "period_low": round(min(v for v in lows if v is not None), 2) if any(v is not None for v in lows) else None,
+        "avg_volume": int(round(sum(v for v in volumes if v is not None) / len([v for v in volumes if v is not None]))) if any(v is not None for v in volumes) else None,
+        "trading_days": len(sorted_rows),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
-def analyse_stock_performance(ticker: str) -> dict:
+def analyse_stock_performance(ticker: str, timeframe: str = "") -> dict:
     """Analyse a stock's performance using Weaviate knowledge base data.
 
     Retrieves price history, earnings transcripts, and news articles from the
@@ -254,6 +292,9 @@ def analyse_stock_performance(ticker: str) -> dict:
     ----------
     ticker : str
         Stock ticker symbol (e.g. ``"AAPL"``, ``"TSLA"``).
+    timeframe : str
+        Optional human-readable timeframe (e.g. ``"2012"``, ``"2024 Q3"``).
+        Passed to the Yahoo Finance fallback for historical data retrieval.
 
     Returns
     -------
@@ -267,6 +308,19 @@ def analyse_stock_performance(ticker: str) -> dict:
     """
     ticker = ticker.upper().strip()
     data = get_ticker_data(ticker)
+    data_source = "weaviate"
+    yahoo_fallback_attempted = False
+    yahoo_fallback_error = ""
+
+    if not any(data.values()):
+        # Fallback: try Yahoo Finance for live data
+        yahoo_fallback_attempted = True
+        try:
+            from ..yahoo_finance_fallback import get_yf_performance_data
+            data = get_yf_performance_data(ticker, timeframe=timeframe)
+            data_source = "yahoo_finance"
+        except Exception as exc:
+            yahoo_fallback_error = str(exc)
 
     if not any(data.values()):
         return {
@@ -274,14 +328,36 @@ def analyse_stock_performance(ticker: str) -> dict:
             "performance_score": None,
             "outlook": "Unknown",
             "justification": f"No data found for ticker {ticker} in the knowledge base.",
-            "data_summary": {"price_records": 0, "earnings_records": 0, "news_records": 0},
+            "data_summary": {
+                "price_records": 0,
+                "earnings_records": 0,
+                "news_records": 0,
+                "source": "none",
+                "dataset_sources": [],
+                "yahoo_finance_fallback_used": False,
+                "yahoo_finance_fallback_attempted": yahoo_fallback_attempted,
+                "yahoo_finance_fallback_error": yahoo_fallback_error,
+                "period_stats": {},
+            },
         }
 
     analysis = _run_async(_analyse_with_llm(ticker, data))
+    period_stats = _compute_period_stats(data.get("price_data", []))
+    dataset_sources = sorted({
+        str(row.get("dataset_source", "unknown"))
+        for key in ("price_data", "earnings", "news")
+        for row in data.get(key, [])
+    })
     analysis["data_summary"] = {
         "price_records": len(data["price_data"]),
         "earnings_records": len(data["earnings"]),
         "news_records": len(data["news"]),
+        "source": data_source,
+        "dataset_sources": dataset_sources,
+        "yahoo_finance_fallback_used": data_source == "yahoo_finance",
+        "yahoo_finance_fallback_attempted": yahoo_fallback_attempted,
+        "yahoo_finance_fallback_error": yahoo_fallback_error,
+        "period_stats": period_stats,
     }
     return analysis
 

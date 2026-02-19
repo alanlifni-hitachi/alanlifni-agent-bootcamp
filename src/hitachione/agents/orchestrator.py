@@ -25,14 +25,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-import sys
-from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
-
-# Ensure tools directory is importable
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from ..config.settings import (
     MAX_ITERATIONS, OPENAI_API_KEY, OPENAI_BASE_URL, PLANNER_MODEL,
@@ -69,6 +64,33 @@ Rules:
 - Keep it concise.
 """
 
+_ENTITY_ALIASES: dict[str, str] = {
+    "tesla": "TSLA",
+    "apple": "AAPL",
+    "google": "GOOGL",
+    "alphabet": "GOOGL",
+    "microsoft": "MSFT",
+    "meta": "META",
+    "facebook": "META",
+    "amazon": "AMZN",
+    "nvidia": "NVDA",
+    "exxon": "XOM",
+    "exxon mobil": "XOM",
+    "chevron": "CVX",
+    "jpmorgan": "JPM",
+    "jp morgan": "JPM",
+}
+
+
+def _augment_entities_from_query(query: str, entities: list[str]) -> list[str]:
+    """Add deterministic ticker aliases mentioned in the raw query text."""
+    merged = {str(symbol).upper() for symbol in entities if str(symbol).strip()}
+    text = query.lower()
+    for company_name, ticker in _ENTITY_ALIASES.items():
+        if re.search(rf"\b{re.escape(company_name)}\b", text):
+            merged.add(ticker)
+    return sorted(merged)
+
 # ── Company retrieval helper ─────────────────────────────────────────────
 
 def _find_symbols(query: str) -> list[str]:
@@ -88,6 +110,7 @@ class Orchestrator:
 
     def __init__(self, max_iterations: int = MAX_ITERATIONS):
         self.max_iter = max_iterations
+        self._llm = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
         self.kb_agent = KnowledgeRetrievalAgent()
         self.researcher = ResearcherAgent()
         self.synthesizer = SynthesizerAgent()
@@ -125,6 +148,11 @@ class Orchestrator:
                 f"timeframe={ctx.timeframe}, sector={ctx.sector}"
             )
 
+            # Track whether user explicitly provided entities in the prompt.
+            # If not, we should run company filtering even if KB retrieval yields
+            # noisy hints, because broad sector/list queries rely on this step.
+            explicit_entities_in_query = bool(ctx.entities)
+
         answer = SynthesizedAnswer()
 
         for iteration in range(1, self.max_iter + 1):
@@ -143,17 +171,36 @@ class Orchestrator:
                 kb_data = self.kb_agent.run(ctx)
                 sp.update(output=kb_data)
                 # Merge entity hints into context
-                for hint in kb_data.get("entity_hints", []):
-                    if hint not in ctx.entities:
-                        ctx.entities.append(hint)
+                if not explicit_entities_in_query:
+                    for hint in kb_data.get("entity_hints", []):
+                        if hint not in ctx.entities:
+                            ctx.entities.append(hint)
+                else:
+                    ctx.observations.append(
+                        "Skipping KB entity hints because query has explicit entities"
+                    )
 
-            # ── STEP 3b: Act – Company retrieval (if entities empty) ───
-            if not ctx.entities:
+            # ── STEP 3b: Act – Company retrieval for broad queries ─────
+            if not explicit_entities_in_query and iteration == 1:
                 with tracer.span("company_retrieval") as sp:
-                    ctx.observations.append("No entities yet – calling company filter")
+                    original_hints = list(ctx.entities)
+                    ctx.observations.append(
+                        "No explicit entities in prompt – calling company filter"
+                    )
                     symbols = _find_symbols(ctx.user_query)
-                    ctx.entities = symbols
-                    sp.update(output=symbols)
+                    # Use company filter as authoritative for broad queries.
+                    # Fall back to KB hints only if filter returns nothing.
+                    if symbols:
+                        ctx.entities = symbols
+                        source = "company_filter"
+                    else:
+                        ctx.entities = original_hints
+                        source = "kb_hints"
+                    sp.update(output={
+                        "symbols": symbols,
+                        "kb_hints": original_hints,
+                        "source": source,
+                    })
 
             if not ctx.entities:
                 ctx.uncertainties.append("Could not identify any tickers")
@@ -172,6 +219,20 @@ class Orchestrator:
             # ── STEP 4: Act – Research ──────────────────────────────────
             with tracer.span("research_fanout") as sp:
                 research = self.researcher.run(ctx, ctx.entities)
+
+                # On retry iterations, merge new results into prior good ones
+                if iteration > 1 and hasattr(ctx, '_prior_research'):
+                    merged: dict[str, Any] = {}
+                    for cr in ctx._prior_research:  # type: ignore[attr-defined]
+                        merged[cr.ticker] = cr
+                    # Overwrite with new results (which may fix prior errors)
+                    for cr in research:
+                        merged[cr.ticker] = cr
+                    research = [merged[t] for t in ctx.entities if t in merged]
+
+                # Stash current research for potential future merging
+                ctx._prior_research = research  # type: ignore[attr-defined]
+
                 sp.update(output={
                     "count": len(research),
                     "tickers": [r.ticker for r in research],
@@ -204,6 +265,20 @@ class Orchestrator:
                 logger.info("Reviewer OK – stopping")
                 break
 
+            # If the issues are not retriable (e.g. data simply does not
+            # exist in the KB), stop immediately – looping won't help.
+            if not feedback.retriable:
+                logger.info(
+                    "Reviewer flagged %d non-retriable issues – stopping",
+                    len(feedback.missing),
+                )
+                if not any("knowledge base" in c.lower() for c in answer.caveats):
+                    answer.caveats.append(
+                        "No data available in the knowledge base for some "
+                        "or all of the requested tickers."
+                    )
+                break
+
             if iteration < self.max_iter:
                 # Reflect: try to address missing items
                 with tracer.span("reflection") as sp:
@@ -224,8 +299,7 @@ class Orchestrator:
     def _parse_intent(self, ctx: TaskContext) -> None:
         """Use LLM to classify intent and extract entities / timeframe."""
         try:
-            client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
-            resp = client.chat.completions.create(
+            resp = self._llm.chat.completions.create(
                 model=PLANNER_MODEL,
                 messages=[
                     {"role": "system", "content": _INTENT_PROMPT},
@@ -251,7 +325,8 @@ class Orchestrator:
         except ValueError:
             ctx.intent = Intent.MIXED
 
-        ctx.entities = [e.upper() for e in data.get("entities", [])]
+        llm_entities = [e.upper() for e in data.get("entities", [])]
+        ctx.entities = _augment_entities_from_query(ctx.user_query, llm_entities)
         ctx.timeframe = data.get("timeframe", ctx.timeframe) or ""
         ctx.sector = data.get("sector", "") or ""
 
@@ -279,21 +354,47 @@ class Orchestrator:
         return steps
 
     def _reflect(self, ctx: TaskContext, feedback) -> dict[str, Any]:
-        """Adjust the context based on reviewer feedback."""
+        """Adjust the context based on reviewer feedback and apply changes.
+
+        On retry iterations, narrows ``ctx.entities`` to only the tickers that
+        need re-research — this avoids wasting API calls on entities that
+        already have complete data.
+        """
         adjustments: dict[str, Any] = {"action": "none"}
 
         missing = feedback.missing
-        # If entities are missing research, they may need to be re-fetched
-        missing_entities = [
-            m for m in missing
-            if "not researched" in m.lower()
-        ]
-        if missing_entities:
-            adjustments["action"] = "retry_missing_entities"
-            adjustments["details"] = missing_entities
+
+        # Collect tickers that need re-research from ANY kind of missing item
+        tickers_to_retry: set[str] = set()
+
+        for msg in missing:
+            # "Entity XXXX not researched"
+            match = re.search(r"Entity\s+(\S+)\s+not researched", msg, re.IGNORECASE)
+            if match:
+                tickers_to_retry.add(match.group(1).upper())
+                continue
+            # "XXXX: missing sentiment rating" / "XXXX: missing performance score"
+            match = re.search(r"^(\S+):\s+missing\s+(sentiment|performance)", msg, re.IGNORECASE)
+            if match:
+                tickers_to_retry.add(match.group(1).upper())
+                continue
+            # "XXXX: performance unavailable" (caveat-style)
+            match = re.search(r"^(\S+):\s+\w+\s+unavailable", msg, re.IGNORECASE)
+            if match:
+                tickers_to_retry.add(match.group(1).upper())
+
+        if tickers_to_retry:
+            adjustments["action"] = "retry_failed_entities"
+            adjustments["entities"] = sorted(tickers_to_retry)
+            # Narrow entity list to only failed tickers for the retry
+            ctx.entities = sorted(tickers_to_retry)
+            ctx.observations.append(
+                f"Retrying {len(tickers_to_retry)} failed entities: "
+                f"{', '.join(sorted(tickers_to_retry))}"
+            )
 
         # If confidence is low, try broader KB search
-        if any("confidence" in m.lower() for m in missing):
+        elif any("confidence" in m.lower() for m in missing):
             adjustments["action"] = "broaden_search"
             ctx.observations.append("Broadening search due to low confidence")
 
